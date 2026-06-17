@@ -4,14 +4,16 @@ import contextlib
 import os
 import platform
 import socket
+import ssl as _ssl
 import time
 import typing
 import urllib.parse
+import urllib.request
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from functools import cache
-from typing import Any, Optional, TypeVar
+from typing import Any, Optional, Sequence, TypeVar
 
 import grpclib.client
 import grpclib.config
@@ -97,7 +99,7 @@ DEFAULT_MAX_RETRIES = 3
 class RetryWarningMessage:
     message: str
     warning_interval: int
-    errors_to_warn_for: list[Status]
+    errors_to_warn_for: typing.List[Status]
 
 
 class ConnectionManager:
@@ -146,23 +148,20 @@ class CustomProtoStatusDetailsCodec(StatusDetailsCodecBase):
     def encode(
         self,
         status: Status,
-        message: str | None,
-        details: Sequence[Message] | None,
+        message: Optional[str],
+        details: Optional[Sequence[Message]],
     ) -> bytes:
         details_proto = api_pb2.RPCStatus(code=status.value, message=message or "")
         if details is not None:
             for detail in details:
                 detail_container = details_proto.details.add()
-                if detail.DESCRIPTOR.full_name.startswith("modal."):
-                    detail_container.Pack(detail, type_url_prefix="type.modal.com/")
-                else:
-                    detail_container.Pack(detail)
+                detail_container.Pack(detail)
         return details_proto.SerializeToString()
 
     def decode(
         self,
         status: Status,
-        message: str | None,
+        message: Optional[str],
         data: bytes,
     ) -> Any:
         sym_db = _sym_db()
@@ -180,6 +179,120 @@ class CustomProtoStatusDetailsCodec(StatusDetailsCodecBase):
 
 
 custom_detail_codec = CustomProtoStatusDetailsCodec()
+
+
+def _get_proxy_url() -> Optional[str]:
+    """Return the proxy URL from environment variables or system settings, or None."""
+    proxy_url = (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
+    if not proxy_url:
+        try:
+            proxies = urllib.request.getproxies()
+            proxy_url = proxies.get("https") or proxies.get("http")
+        except Exception:
+            pass
+    return proxy_url or None
+
+
+def _patch_channel_for_proxy(channel: grpclib.client.Channel) -> None:
+    """Monkey-patch a grpclib Channel to tunnel through an HTTP CONNECT proxy.
+
+    grpclib does not natively honor HTTP_PROXY / HTTPS_PROXY environment
+    variables. This patch intercepts _create_connection and establishes the
+    connection via the proxy using the HTTP CONNECT method, then optionally
+    upgrades to TLS with asyncio.start_tls().
+    """
+    proxy_url = _get_proxy_url()
+    if not proxy_url:
+        return
+
+    parsed = urllib.parse.urlparse(proxy_url)
+    proxy_host = parsed.hostname
+    proxy_port = parsed.port or 3128
+    proxy_user = parsed.username
+    proxy_password = parsed.password
+
+    _original = channel._create_connection
+
+    async def _proxied_create_connection() -> typing.Any:
+        # unix-socket channels don't go through a proxy
+        if channel._path is not None:
+            return await _original()
+
+        host = channel._host
+        port = channel._port
+        loop = asyncio.get_event_loop()
+
+        # 1) Open a bare TCP socket to the proxy (async, DNS/IPv6-safe).
+        infos = await loop.getaddrinfo(proxy_host, proxy_port, type=socket.SOCK_STREAM)
+        family, socktype, sockproto, _, addr = infos[0]
+        sock = socket.socket(family, socktype, sockproto)
+        sock.setblocking(False)
+        try:
+            await loop.sock_connect(sock, addr)
+
+            # 2) Establish the tunnel with an HTTP CONNECT on the bare socket.
+            connect_headers = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            if proxy_user and proxy_password:
+                import base64
+
+                creds = base64.b64encode(f"{proxy_user}:{proxy_password}".encode()).decode()
+                connect_headers += f"Proxy-Authorization: Basic {creds}\r\n"
+            connect_headers += "\r\n"
+            await loop.sock_sendall(sock, connect_headers.encode())
+
+            response = b""
+            while b"\r\n\r\n" not in response:
+                chunk = await loop.sock_recv(sock, 4096)
+                if not chunk:
+                    raise OSError("Proxy closed connection before sending a response")
+                response += chunk
+
+            status_line = response.split(b"\r\n", 1)[0].decode(errors="replace")
+            if " 200 " not in status_line:
+                raise OSError(f"Proxy CONNECT failed: {status_line}")
+
+            # For a client-speaks-first TLS handshake the proxy sends nothing past
+            # the CONNECT response header. If it did, those bytes belong to the
+            # tunneled stream and we can't feed them to create_connection cleanly.
+            if response[response.index(b"\r\n\r\n") + 4 :]:
+                raise OSError("Unexpected data from proxy after CONNECT response")
+        except BaseException:
+            sock.close()
+            raise
+
+        # 3) Hand the tunneled socket to asyncio, which sets up TLS and attaches
+        #    grpclib's HTTP/2 protocol as the connection's protocol from the first
+        #    byte. This mirrors grpclib's own _create_connection (just with sock=)
+        #    so no frames are lost and ALPN ("h2") is negotiated here.
+        if channel._ssl is not None:
+            if isinstance(channel._ssl, _ssl.SSLContext):
+                ssl_arg: typing.Any = channel._ssl
+            else:
+                ssl_arg = _ssl.create_default_context()
+                ssl_arg.set_alpn_protocols(["h2"])
+            server_hostname: Optional[str] = channel._config.ssl_target_name_override or host
+        else:
+            ssl_arg = False
+            server_hostname = None
+
+        try:
+            _, protocol = await loop.create_connection(
+                channel._protocol_factory,
+                sock=sock,
+                ssl=ssl_arg,
+                server_hostname=server_hostname if ssl_arg else None,
+            )
+        except BaseException:
+            sock.close()
+            raise
+        return protocol
+
+    channel._create_connection = _proxied_create_connection
 
 
 def create_channel(
@@ -227,6 +340,8 @@ def create_channel(
 
     grpclib.events.listen(channel, grpclib.events.SendRequest, send_request)
 
+    _patch_channel_for_proxy(channel)
+
     return channel
 
 
@@ -244,7 +359,7 @@ if typing.TYPE_CHECKING:
 async def unary_stream(
     method: "modal._grpc_client.UnaryStreamWrapper[RequestType, ResponseType]",
     request: RequestType,
-    metadata: Any | None = None,
+    metadata: Optional[Any] = None,
 ) -> AsyncIterator[ResponseType]:
     # TODO: remove this, since we have a method now
     async for item in method.unary_stream(request, metadata):
@@ -256,18 +371,18 @@ class Retry:
     base_delay: float = 0.1
     max_delay: float = 1
     delay_factor: float = 2
-    max_retries: int | None = DEFAULT_MAX_RETRIES
+    max_retries: Optional[int] = DEFAULT_MAX_RETRIES
     additional_status_codes: list = field(default_factory=list)
-    attempt_timeout: float | None = None  # timeout for each attempt
-    total_timeout: float | None = None  # timeout for the entire function call
+    attempt_timeout: Optional[float] = None  # timeout for each attempt
+    total_timeout: Optional[float] = None  # timeout for the entire function call
     attempt_timeout_floor: float = 2.0  # always have at least this much timeout (only for total_timeout)
-    warning_message: RetryWarningMessage | None = None
+    warning_message: Optional[RetryWarningMessage] = None
 
 
 async def retry_transient_errors(
     fn: "grpclib.client.UnaryUnaryMethod[RequestType, ResponseType]",
     req: RequestType,
-    max_retries: int | None = DEFAULT_MAX_RETRIES,
+    max_retries: Optional[int] = DEFAULT_MAX_RETRIES,
 ) -> ResponseType:
     """Minimum API version of _retry_transient_errors that works with grpclib.client.UnaryUnaryMethod.
 
@@ -276,7 +391,7 @@ async def retry_transient_errors(
     return await _retry_transient_errors(fn, req, retry=Retry(max_retries=max_retries))
 
 
-def get_server_retry_policy(exc: Exception) -> api_pb2.RPCRetryPolicy | None:
+def get_server_retry_policy(exc: Exception) -> Optional[api_pb2.RPCRetryPolicy]:
     """Get server retry policy."""
     if not isinstance(exc, GRPCError) or not exc.details:
         return None
@@ -332,7 +447,7 @@ async def _retry_transient_errors(
     ],
     req: RequestType,
     retry: Retry,
-    metadata: list[tuple[str, str]] | None = None,
+    metadata: Optional[list[tuple[str, str]]] = None,
 ) -> ResponseType:
     """Retry on transient gRPC failures with back-off until max_retries is reached.
     If max_retries is None, retry forever."""
@@ -400,7 +515,7 @@ async def _retry_transient_errors(
             # in grpclib<=0.4.7. See above (search for `write_appdata`).
 
             # Server side instruction for retries
-            max_throttle_wait: int | None = config.get("max_throttle_wait")
+            max_throttle_wait: Optional[int] = config.get("max_throttle_wait")
             if (
                 max_throttle_wait != 0
                 and isinstance(exc, GRPCError)
@@ -498,7 +613,7 @@ def find_free_port() -> int:
         return s.getsockname()[1]
 
 
-def get_proto_oneof(message: Message, oneof_group: str) -> Message | None:
+def get_proto_oneof(message: Message, oneof_group: str) -> Optional[Message]:
     oneof_field = message.WhichOneof(oneof_group)
     if oneof_field is None:
         return None
