@@ -135,6 +135,12 @@ enum EndpointInputModality {
   ENDPOINT_INPUT_MODALITY_AUDIO = 3;
 }
 
+enum EndpointLifecycleStatus {
+  ENDPOINT_LIFECYCLE_STATUS_UNSPECIFIED = 0;
+  ENDPOINT_LIFECYCLE_STATUS_ACTIVE = 1;
+  ENDPOINT_LIFECYCLE_STATUS_STOPPED = 2;
+}
+
 enum EndpointProvisioningStatus {
   ENDPOINT_PROVISIONING_STATUS_UNSPECIFIED = 0;
   ENDPOINT_PROVISIONING_STATUS_PENDING = 1;
@@ -582,6 +588,12 @@ message AppPublishResponse {
 message AppRollbackRequest {
   string app_id = 1;
   int32 version = 2;  // signed as we support negative "roll back n versions" requests
+}
+
+message AppRollbackResponse {
+  string url = 1;
+  repeated Warning server_warnings = 3;
+  double deployed_at = 4;
 }
 
 message AppRolloverRequest {
@@ -1428,6 +1440,7 @@ message EndpointCreateRequest {
   repeated EndpointApiSurface api_surfaces = 6;
   repeated EndpointInputModality input_modalities = 7;
   string environment_name = 8;
+  bool unauthenticated = 9;
 }
 
 message EndpointCreateResponse {
@@ -1443,10 +1456,37 @@ message EndpointCustomModelSource {
   }
 }
 
+message EndpointGetByNameRequest {
+  string name = 1;
+  string environment_name = 2;
+}
+
+message EndpointGetByNameResponse {
+  string endpoint_id = 1;
+  string environment_name = 2;
+}
+
+message EndpointGetLifecycleRequest {
+  string endpoint_id = 1;
+}
+
+message EndpointGetLifecycleResponse {
+  EndpointLifecycle lifecycle = 1;
+}
+
 message EndpointHuggingFaceModelSource {
   string repo_id = 1;
   string revision = 2;
   string huggingface_token = 3;
+}
+
+message EndpointLifecycle {
+  EndpointLifecycleStatus status = 1;
+  double created_at = 2;
+  string created_by = 3;  // User or service user name
+  double stopped_at = 4;  // Unset when Endpoint is active
+  string stopped_by = 5;  // User or service user name
+  string environment_name = 6;
 }
 
 message EndpointListItem {
@@ -2413,6 +2453,7 @@ message HTTPConfig {
   uint32 exit_grace_period = 4;
   bool h2_enabled = 5;
   uint32 target_concurrency = 6;
+  bool unauthenticated = 7;
 }
 
 message Image {
@@ -3830,6 +3871,15 @@ message TemplateListResponse {
   repeated TemplateListItem items = 1;
 }
 
+message TokenCreateResponse {
+  string token_id = 1;
+  string token_secret = 2;
+}
+
+message TokenDeleteRequest {
+  string token_id = 2;
+}
+
 message TokenFlowCreateRequest {
   string utm_source = 3;
   int32 localhost_port = 4;
@@ -4193,6 +4243,42 @@ message WebhookConfig {
   string ephemeral_suffix = 11;  // Additional URL suffix added for ephemeral Apps
 }
 
+message WebhookToken {
+  string token_id = 1;
+  double created_at = 2;
+  bool scoped = 3;
+}
+
+message WebhookTokenCreateRequest {
+  bool scoped = 1;
+}
+
+message WebhookTokenEnvironmentAddRequest {
+  string token_id = 1;
+  string environment_id = 2;
+}
+
+message WebhookTokenEnvironmentListRequest {
+  string token_id = 1;
+}
+
+message WebhookTokenEnvironmentListResponse {
+  repeated string environment_ids = 1;
+}
+
+message WebhookTokenEnvironmentRemoveRequest {
+  string token_id = 1;
+  string environment_id = 2;
+}
+
+message WebhookTokenListForEnvironmentRequest {
+  string environment_name = 1;
+}
+
+message WebhookTokenListResponse {
+  repeated WebhookToken tokens = 1;
+}
+
 message WorkspaceBillingReportItem {
   string object_id = 1;
   string description = 2;
@@ -4200,7 +4286,8 @@ message WorkspaceBillingReportItem {
   google.protobuf.Timestamp interval = 4;
   string cost = 5;
   map<string, string> tags = 6;
-  map<string, double> cost_by_resource = 7;
+  map<string, double> cost_by_resource_float = 7; // old field to be removed
+  map<string, string> cost_by_resource = 8;
 }
 
 message WorkspaceBillingReportRequest {
@@ -4266,7 +4353,7 @@ service ModalClient {
   rpc AppList(AppListRequest) returns (AppListResponse);
   rpc AppLookup(AppLookupRequest) returns (AppLookupResponse);
   rpc AppPublish(AppPublishRequest) returns (AppPublishResponse);
-  rpc AppRollback(AppRollbackRequest) returns (google.protobuf.Empty);
+  rpc AppRollback(AppRollbackRequest) returns (AppRollbackResponse);
   rpc AppRollover(AppRolloverRequest) returns (AppRolloverResponse);
   rpc AppSetObjects(AppSetObjectsRequest) returns (google.protobuf.Empty);
   rpc AppSetTags(AppSetTagsRequest) returns (google.protobuf.Empty);
@@ -4330,6 +4417,8 @@ service ModalClient {
 
   // Endpoints
   rpc EndpointCreate(EndpointCreateRequest) returns (EndpointCreateResponse);
+  rpc EndpointGetByName(EndpointGetByNameRequest) returns (EndpointGetByNameResponse);
+  rpc EndpointGetLifecycle(EndpointGetLifecycleRequest) returns (EndpointGetLifecycleResponse);
   rpc EndpointList(EndpointListRequest) returns (EndpointListResponse);
   rpc EndpointStop(EndpointStopRequest) returns (EndpointStopResponse);
 
@@ -4509,6 +4598,15 @@ service ModalClient {
   rpc VolumeRemoveFile(VolumeRemoveFileRequest) returns (google.protobuf.Empty);
   rpc VolumeRemoveFile2(VolumeRemoveFile2Request) returns (google.protobuf.Empty);
   rpc VolumeRename(VolumeRenameRequest) returns (google.protobuf.Empty);
+
+  // Webhook tokens (proxy auth tokens)
+  rpc WebhookTokenCreate(WebhookTokenCreateRequest) returns (TokenCreateResponse);
+  rpc WebhookTokenDelete(TokenDeleteRequest) returns (google.protobuf.Empty);
+  rpc WebhookTokenEnvironmentAdd(WebhookTokenEnvironmentAddRequest) returns (google.protobuf.Empty);
+  rpc WebhookTokenEnvironmentList(WebhookTokenEnvironmentListRequest) returns (WebhookTokenEnvironmentListResponse);
+  rpc WebhookTokenEnvironmentRemove(WebhookTokenEnvironmentRemoveRequest) returns (google.protobuf.Empty);
+  rpc WebhookTokenList(google.protobuf.Empty) returns (WebhookTokenListResponse);
+  rpc WebhookTokenListForEnvironment(WebhookTokenListForEnvironmentRequest) returns (WebhookTokenListResponse);
 
   // Workspaces
   rpc WorkspaceBillingReport(WorkspaceBillingReportRequest) returns (stream WorkspaceBillingReportItem);

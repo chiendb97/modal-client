@@ -5,6 +5,8 @@ import enum
 import json
 import logging
 import os
+import re
+import textwrap
 import time
 import typing
 import uuid
@@ -43,13 +45,11 @@ from .container_process import _ContainerProcess
 from .exception import (
     ClientClosed,
     ConflictError,
-    Error,
     ExecutionError,
     InvalidError,
     NotFoundError,
     SandboxTerminatedError,
     SandboxTimeoutError,
-    TimeoutError,
 )
 from .file_io import FileWatchEvent, FileWatchEventType, _FileIO, ls, mkdir, rm, watch
 from .io_streams import (
@@ -117,6 +117,28 @@ def _format_sandbox_create_timing_log(
 # e.g. 'runsc exec ...'. So we use 2**16 as the limit.
 ARG_MAX_BYTES = 2**16
 TTL_NO_EXPIRY_SENTINEL = -1
+
+
+_SECRET_KEYNAME_REGEX = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_SECRET_KEYNAME_MAX_LEN = 2**14
+_SECRET_VALUE_MAX_LEN = 2**15
+
+
+def _validate_sandbox_env(env: dict[str, str]) -> None:
+    for key, value in env.items():
+        if not key:
+            raise InvalidError("Secret key name cannot be empty")
+        if len(key) > _SECRET_KEYNAME_MAX_LEN:
+            shortkey = textwrap.shorten(key, width=32)
+            raise InvalidError(f"Secret key name {shortkey!r} is too long (max {_SECRET_KEYNAME_MAX_LEN})")
+        if len(value) > _SECRET_VALUE_MAX_LEN:
+            shortkey = textwrap.shorten(key, width=32)
+            raise InvalidError(f"Secret value for key {shortkey!r} is too long (max {_SECRET_VALUE_MAX_LEN})")
+        if not _SECRET_KEYNAME_REGEX.match(key):
+            raise InvalidError(
+                f"Secret key name {key!r} is invalid for environment variables. "
+                "Only letters, numbers, and underscores are allowed."
+            )
 
 
 def _ttl_to_wire_ttl(ttl: int | None) -> int:
@@ -564,7 +586,8 @@ class _Sandbox(_Object, type_prefix="sb"):
             block_network: Whether to block network access.
             outbound_cidr_allowlist: List of CIDRs the sandbox is allowed to access. If None, all CIDRs are allowed.
             outbound_domain_allowlist: List of domain names the sandbox is allowed to access. Supports
-                wildcard prefixes (``*.``).
+                wildcard prefixes (``*.``); a bare ``"*"`` allows all domains. The outbound policy
+                can be replaced later via `Sandbox._experimental_set_outbound_network_policy`.
             inbound_cidr_allowlist:
                 List of CIDRs allowed to connect inbound to the sandbox (tunnels and connection tokens). If None,
                 all CIDRs are allowed.
@@ -870,8 +893,17 @@ class _Sandbox(_Object, type_prefix="sb"):
                 )
 
         secrets = secrets or []
+        ephemeral_env: dict[str, str] = {}
         if env:
-            secrets = [*secrets, _Secret.from_dict(env)]
+            env_type_err = "the env argument to Sandbox must be a dict[str, str | None]"
+            if not isinstance(env, dict):
+                raise InvalidError(env_type_err)
+            ephemeral_env = {k: v for k, v in env.items() if v is not None}
+            if not all(isinstance(k, str) for k in ephemeral_env) or not all(
+                isinstance(v, str) for v in ephemeral_env.values()
+            ):
+                raise InvalidError(env_type_err)
+            _validate_sandbox_env(ephemeral_env)
 
         image = image or _default_image
 
@@ -951,7 +983,11 @@ class _Sandbox(_Object, type_prefix="sb"):
                 cloud_bucket_mounts=cloud_bucket_mounts_to_proto(cloud_bucket_mounts),
             )
 
-            create_req = api_pb2.SandboxCreateV2Request(app_id=load_context.app_id, definition=definition)
+            create_req = api_pb2.SandboxCreateV2Request(
+                app_id=load_context.app_id,
+                definition=definition,
+                ephemeral_secrets=api_pb2.StringMap(contents=ephemeral_env) if ephemeral_env else None,
+            )
             assert load_context.client._auth_token_manager
             auth_token = await load_context.client._auth_token_manager.get_token()
             rpc_start = time.monotonic()
@@ -1215,6 +1251,39 @@ class _Sandbox(_Object, type_prefix="sb"):
         )
         await self._client.stub.SandboxTagsSet(req)
 
+    async def _experimental_set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: Sequence[str] | None = None,
+        outbound_domain_allowlist: Sequence[str] | None = None,
+    ) -> None:
+        """Replace the outbound network policy of a running Sandbox.
+
+        Established connections that the new policy no longer permits are
+        terminated.
+
+        Args:
+            outbound_cidr_allowlist: List of CIDRs the Sandbox is allowed to access. If None, all CIDRs are allowed.
+            outbound_domain_allowlist: List of domain names the Sandbox is allowed to access. Supports
+                wildcard prefixes (``*.``); a bare ``"*"`` allows all domains.
+        """
+        self._ensure_v1("_experimental_set_outbound_network_policy")
+        task_id = await self._get_task_id()
+        command_router_client = await self._get_command_router_client(task_id)
+
+        if outbound_cidr_allowlist is not None or outbound_domain_allowlist is not None:
+            network_access = api_pb2.NetworkAccess(
+                network_access_type=api_pb2.NetworkAccess.NetworkAccessType.ALLOWLIST,
+                allowed_cidrs=list(outbound_cidr_allowlist or []),
+                allowed_domains=list(outbound_domain_allowlist or []),
+            )
+        else:
+            network_access = api_pb2.NetworkAccess(
+                network_access_type=api_pb2.NetworkAccess.NetworkAccessType.OPEN,
+            )
+        req = sr_pb2.TaskSetNetworkAccessRequest(task_id=task_id, network_access=network_access)
+        await command_router_client.set_network_access(req)
+
     async def snapshot_filesystem(
         self,
         timeout: int = 55,
@@ -1232,7 +1301,7 @@ class _Sandbox(_Object, type_prefix="sb"):
                 the image indefinitely.
 
         Returns:
-            An [`Image`](https://modal.com/docs/reference/modal.Image) object which can be used to spawn a new
+            An [`Image`](https://modal.com/docs/sdk/py/latest/modal.Image) object which can be used to spawn a new
             Sandbox with the same filesystem.
         """
         if os.environ.get("MODAL_USE_LEGACY_FILESYSTEM_SNAPSHOT") == "1" and not self._is_v2:
@@ -1465,24 +1534,21 @@ class _Sandbox(_Object, type_prefix="sb"):
         if timeout <= 0:
             raise InvalidError(f"`timeout` must be positive, got: {timeout}")
 
-        deadline = time.monotonic() + timeout
-        remaining_timeout = deadline - time.monotonic()
-        while remaining_timeout > 0:
-            req = api_pb2.SandboxWaitUntilReadyRequest(
-                sandbox_id=self.object_id,
-                timeout=min(remaining_timeout, 50.0),
-            )
-            resp = await self._client.stub.SandboxWaitUntilReady(req)
-            if resp.ready_at > 0:
-                return
-
-            remaining_timeout = deadline - time.monotonic()
-        raise TimeoutError()
+        # Route to the task command router for both V1 and V2 sandboxes.
+        task_id = await self._get_task_id(raise_if_task_complete=True)
+        try:
+            command_router_client = await self._get_command_router_client(task_id)
+        except NotFoundError as e:
+            # We do this to maintain backwards compatibility within wait_until_ready.
+            # The V1 implementation would raise ConflictError instead of NotFoundError
+            # if the sandbox was terminated, so we do the same for V2.
+            raise ConflictError(str(e)) from e
+        await command_router_client.sandbox_wait_until_ready(task_id, timeout=timeout)
 
     async def tunnels(self, timeout: int = 50) -> dict[int, Tunnel]:
         """Get Tunnel metadata for the sandbox.
 
-        NOTE: Previous to client [v0.64.153](https://modal.com/docs/reference/changelog#064153-2024-09-30), this
+        NOTE: Previous to client [v0.64.153](https://modal.com/docs/sdk/py/changelog#064153-2024-09-30), this
         returned a list of `TunnelData` objects.
 
         Args:
@@ -1638,7 +1704,7 @@ class _Sandbox(_Object, type_prefix="sb"):
                 resp = await stub.SandboxGetTaskId(req)
             if not resp.task_id and raise_if_task_complete and resp.HasField("task_result"):
                 msg = resp.task_result.exception or "Sandbox already finished"
-                raise Error(msg)
+                raise ConflictError(msg)
             self._task_id = resp.task_id
             if not self._task_id:
                 await asyncio.sleep(0.5)
@@ -1714,7 +1780,7 @@ class _Sandbox(_Object, type_prefix="sb"):
     ):
         """Execute a command in the Sandbox and return a ContainerProcess handle.
 
-        See the [`ContainerProcess`](https://modal.com/docs/reference/modal.container_process#modalcontainer_processcontainerprocess)
+        See the [`ContainerProcess`](https://modal.com/docs/sdk/py/latest/modal.container_process#modalcontainer_processcontainerprocess)
         docs for more information.
 
         Args:
@@ -2007,7 +2073,8 @@ class _Sandbox(_Object, type_prefix="sb"):
 
         **Deprecated (2026-03-09):** Use the `Sandbox.filesystem` APIs instead for improved reliability.
 
-        See the [`FileIO`](https://modal.com/docs/reference/modal.file_io#modalfile_iofileio) docs for more information.
+        See the [`FileIO`](https://modal.com/docs/sdk/py/latest/modal.file_io#modalfile_iofileio)
+        docs for more information.
 
         Args:
             path: Absolute path of the file inside the sandbox.
@@ -2110,7 +2177,7 @@ class _Sandbox(_Object, type_prefix="sb"):
     @property
     def stdout(self) -> _StreamReader[str]:
         """
-        [`StreamReader`](https://modal.com/docs/reference/modal.io_streams#modalio_streamsstreamreader)
+        [`StreamReader`](https://modal.com/docs/sdk/py/latest/modal.io_streams#modalio_streamsstreamreader)
         for the sandbox's stdout stream.
 
         Returns:
@@ -2122,7 +2189,7 @@ class _Sandbox(_Object, type_prefix="sb"):
     @property
     def stderr(self) -> _StreamReader[str]:
         """
-        [`StreamReader`](https://modal.com/docs/reference/modal.io_streams#modalio_streamsstreamreader)
+        [`StreamReader`](https://modal.com/docs/sdk/py/latest/modal.io_streams#modalio_streamsstreamreader)
         for the Sandbox's stderr stream.
 
         Returns:
@@ -2134,7 +2201,7 @@ class _Sandbox(_Object, type_prefix="sb"):
     @property
     def stdin(self) -> _StreamWriter:
         """
-        [`StreamWriter`](https://modal.com/docs/reference/modal.io_streams#modalio_streamsstreamwriter)
+        [`StreamWriter`](https://modal.com/docs/sdk/py/latest/modal.io_streams#modalio_streamsstreamwriter)
         for the Sandbox's stdin stream.
 
         Returns:

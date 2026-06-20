@@ -1144,10 +1144,11 @@ class MockClientServicer(api_grpc.ModalClientBase):
 
         rollback_history = self.app_deployment_history[request.app_id][rollback_version - 1]
         rollback_client = rollback_history["client_version"]
+        deployed_at = datetime.datetime.now().timestamp()
         self.app_deployment_history[request.app_id].append(
             {
                 "app_id": request.app_id,
-                "deployed_at": datetime.datetime.now().timestamp(),
+                "deployed_at": deployed_at,
                 "version": current_version + 1,
                 "client_version": rollback_client,
                 "deployed_by": "foo-user",
@@ -1160,7 +1161,12 @@ class MockClientServicer(api_grpc.ModalClientBase):
         )
 
         self.app_state_history[request.app_id].append(api_pb2.APP_STATE_DEPLOYED)
-        await stream.send_message(Empty())
+        response = api_pb2.AppRollbackResponse(
+            url="http://test.modal.com/foo/bar",
+            server_warnings=[],
+            deployed_at=deployed_at,
+        )
+        await stream.send_message(response)
 
     async def AppRollover(self, stream):
         request: api_pb2.AppRolloverRequest = await stream.recv_message()
@@ -1729,6 +1735,8 @@ class MockClientServicer(api_grpc.ModalClientBase):
             name = next(iter(self.environments))
         if name in self.environments:
             environment_id = self.environments[name]
+        elif name == "does-not-exist":
+            raise GRPCError(Status.INVALID_ARGUMENT, "Environment 'does-not-exist' not found")
         else:
             environment_id = f"en-{len(self.environments) + 1}"
             self.environments[name] = environment_id
@@ -2877,17 +2885,33 @@ class MockClientServicer(api_grpc.ModalClientBase):
 
     async def WorkspaceBillingReport(self, stream):
         # Dummy implementation
-        await stream.recv_message()
+        request = await stream.recv_message()
 
-        item = api_pb2.WorkspaceBillingReportItem(
-            object_id="ap-123",
-            description="app1",
-            environment_name="test",
-            cost="100.123456",
-            tags={"team": "eng", "project": "p7r"},
-        )
-        item.interval.FromDatetime(datetime.datetime(2025, 1, 1, 0, 0, 0))
-        await stream.send_message(item)
+        messages = [
+            api_pb2.WorkspaceBillingReportItem(
+                object_id="ap-123",
+                description="app1",
+                environment_name="main",
+                cost="100.123456",
+                tags={"team": "eng", "project": "p7r"},
+                cost_by_resource={"CPU": "100", "Memory": "0.123456"},
+            )
+        ]
+        if len(request.environment_ids) == 0:
+            messages.append(
+                api_pb2.WorkspaceBillingReportItem(
+                    object_id="ap-123",
+                    description="app1",
+                    environment_name="test",
+                    cost="100.123456",
+                    tags={"team": "eng", "project": "p7r"},
+                    cost_by_resource={"CPU": "100", "Memory": "0.123456"},
+                )
+            )
+
+        for i, item in enumerate(messages):
+            item.interval.FromDatetime(datetime.datetime(2025, 1, 1, i, 0, 0))
+            await stream.send_message(item)
 
     async def WorkspaceDashboardUrlGet(self, stream):
         request = await stream.recv_message()

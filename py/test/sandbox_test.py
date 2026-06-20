@@ -21,10 +21,10 @@ from modal import (
     Secret,
     Volume,
 )
-from modal.exception import DeprecationError, Error, InvalidError, TimeoutError
+from modal.exception import ConflictError, DeprecationError, InvalidError, TimeoutError
 from modal.sandbox import SandboxVersion, SidecarContainer, _get_sandbox_version
 from modal.stream_type import StreamType
-from modal_proto import api_pb2
+from modal_proto import api_pb2, task_command_router_pb2 as sr_pb2
 
 from .supports.skip import skip_windows
 
@@ -660,6 +660,30 @@ def test_sandbox_outbound_domain_allowlist(app, servicer):
     sb.terminate()
 
 
+def test_sandbox__experimental_set_outbound_network_policy(app, servicer):
+    sb = Sandbox.create("echo", "test", outbound_domain_allowlist=[], app=app)
+
+    # Allowlist mode
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        sb._experimental_set_outbound_network_policy(
+            outbound_domain_allowlist=["example.com"], outbound_cidr_allowlist=["8.8.8.8/32"]
+        )
+        (req,) = tcr_ctx.get_requests("TaskSetNetworkAccess")
+
+    net = req.network_access
+    assert net.network_access_type == api_pb2.NetworkAccess.NetworkAccessType.ALLOWLIST
+    assert list(net.allowed_domains) == ["example.com"]
+    assert list(net.allowed_cidrs) == ["8.8.8.8/32"]
+
+    # No arguments sends OPEN type (server may reject this currently).
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        sb._experimental_set_outbound_network_policy()
+        (req,) = tcr_ctx.get_requests("TaskSetNetworkAccess")
+    assert req.network_access.network_access_type == api_pb2.NetworkAccess.NetworkAccessType.OPEN
+
+    sb.terminate()
+
+
 @skip_non_subprocess
 def test_sandbox_inbound_cidr_allowlist(app, servicer):
     # Cannot combine with block_network
@@ -1034,6 +1058,60 @@ def test_experimental_sandbox_create_cloud_bucket_mount(app, servicer):
         assert req.definition.cloud_bucket_mounts[0].bucket_type == api_pb2.CloudBucketMount.BucketType.S3
 
 
+def test_experimental_sandbox_create_env_uses_ephemeral_secrets(app, servicer):
+    with servicer.intercept() as ctx:
+        Sandbox._experimental_create("echo", "hi", app=app, env={"FOO": "bar", "BAZ": "qux"})
+        req = ctx.pop_request("SandboxCreateV2")
+
+    assert dict(req.ephemeral_secrets.contents) == {"FOO": "bar", "BAZ": "qux"}
+    assert ctx.get_requests("SecretGetOrCreate") == []
+    assert list(req.definition.secret_ids) == []
+
+
+def test_experimental_sandbox_create_env_drops_none_values(app, servicer):
+    with servicer.intercept() as ctx:
+        Sandbox._experimental_create("echo", "hi", app=app, env={"FOO": "bar", "SKIP": None})
+        req = ctx.pop_request("SandboxCreateV2")
+
+    assert dict(req.ephemeral_secrets.contents) == {"FOO": "bar"}
+
+
+def test_experimental_sandbox_create_env_and_secrets_coexist(app, servicer):
+    secret = Secret.from_dict({"DB_PASSWORD": "hunter2"})
+    with servicer.intercept() as ctx:
+        Sandbox._experimental_create("echo", "hi", app=app, env={"FOO": "bar"}, secrets=[secret])
+        req = ctx.pop_request("SandboxCreateV2")
+
+    assert dict(req.ephemeral_secrets.contents) == {"FOO": "bar"}
+    assert len(req.definition.secret_ids) == 1
+
+
+def test_experimental_sandbox_create_no_env_omits_ephemeral_secrets(app, servicer):
+    with servicer.intercept() as ctx:
+        Sandbox._experimental_create("echo", "hi", app=app)
+        req = ctx.pop_request("SandboxCreateV2")
+
+    assert not req.HasField("ephemeral_secrets")
+
+
+@pytest.mark.parametrize("bad_key", ["MY KEY", "1FOO", "FOO-BAR", "FOO$"])
+def test_experimental_sandbox_create_env_rejects_invalid_key(app, servicer, bad_key):
+    with servicer.intercept() as ctx:
+        with pytest.raises(InvalidError, match="invalid for environment variables"):
+            Sandbox._experimental_create("echo", "hi", app=app, env={bad_key: "value"})
+        assert ctx.get_requests("SandboxCreateV2") == []
+
+
+def test_experimental_sandbox_create_env_rejects_empty_key(app, servicer):
+    with pytest.raises(InvalidError, match="cannot be empty"):
+        Sandbox._experimental_create("echo", "hi", app=app, env={"": "value"})
+
+
+def test_experimental_sandbox_create_env_rejects_value_too_long(app, servicer):
+    with pytest.raises(InvalidError, match="is too long"):
+        Sandbox._experimental_create("echo", "hi", app=app, env={"FOO": "x" * (2**15 + 1)})
+
+
 @skip_non_subprocess
 def test_sandbox_exec_pty(app, servicer):
     sb = Sandbox.create("sleep", "infinity", app=app)
@@ -1330,7 +1408,7 @@ def test_exec_on_terminate_sandbox_raises(servicer, client, app):
                 ),
             ),
         )
-        with pytest.raises(Error):
+        with pytest.raises(ConflictError, match="Sandbox was cancelled by user"):
             sb.exec("echo", "hello")
 
 
@@ -1339,6 +1417,9 @@ def test_exec_on_terminate_sandbox_raises(servicer, client, app):
 detach_error_funcs = {
     "get_tags": lambda sb: sb.get_tags(),
     "set_tags": lambda sb: sb.set_tags({"hello": "world"}),
+    "_experimental_set_outbound_network_policy": lambda sb: sb._experimental_set_outbound_network_policy(
+        outbound_domain_allowlist=[], outbound_cidr_allowlist=[]
+    ),
     "snapshot_filesystem": lambda sb: sb.snapshot_filesystem(),
     "snapshot_directory": lambda sb: sb.snapshot_directory("/tmp"),
     "tunnels": lambda sb: sb.tunnels(),
@@ -1582,62 +1663,65 @@ def test_sandbox_wait_allowed_after_detached(app, servicer):
     assert sb.returncode != 0
 
 
-def test_sandbox_wait_until_ready(app, servicer):
-    sb = Sandbox.create("bash", "-c", "sleep 100", app=app, readiness_probe=modal.Probe.with_tcp(8080))
+def _create_wait_until_ready_sandbox(app, sandbox_version: SandboxVersion, *, with_readiness_probe: bool = True):
+    if sandbox_version == SandboxVersion.V2:
+        return Sandbox._experimental_create("bash", "-c", "sleep 100", app=app)
+    readiness_probe = modal.Probe.with_tcp(8080) if with_readiness_probe else None
+    return Sandbox.create("bash", "-c", "sleep 100", app=app, readiness_probe=readiness_probe)
 
-    with servicer.intercept() as ctx:
-        ctx.add_response("SandboxWaitUntilReady", api_pb2.SandboxWaitUntilReadyResponse(ready_at=123.456))
+
+@pytest.mark.parametrize("sandbox_version", [SandboxVersion.V1, SandboxVersion.V2], ids=["v1", "v2"])
+def test_sandbox_wait_until_ready(app, servicer, sandbox_version):
+    sb = _create_wait_until_ready_sandbox(app, sandbox_version)
+
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        tcr_ctx.add_response("SandboxWaitUntilReady", sr_pb2.SandboxWaitUntilReadyTcrResponse(ready_at=123.456))
         sb.wait_until_ready(timeout=5)
-        req = ctx.pop_request("SandboxWaitUntilReady")
+        req = tcr_ctx.pop_request("SandboxWaitUntilReady")
 
-    assert req.sandbox_id == sb.object_id
+    assert req.task_id
     assert 0 < req.timeout <= 5
 
     sb.terminate()
 
 
-def test_sandbox_wait_until_ready_retries_deadline_exceeded(app, servicer):
-    sb = Sandbox.create("bash", "-c", "sleep 100", app=app, readiness_probe=modal.Probe.with_tcp(8080))
-    requests: list[api_pb2.SandboxWaitUntilReadyRequest] = []
+@pytest.mark.parametrize("sandbox_version", [SandboxVersion.V1, SandboxVersion.V2], ids=["v1", "v2"])
+def test_sandbox_wait_until_ready_times_out(app, servicer, sandbox_version):
+    sb = _create_wait_until_ready_sandbox(app, sandbox_version)
+    requests: list[sr_pb2.SandboxWaitUntilReadyTcrRequest] = []
 
     async def handle_wait_until_ready_request(servicer, stream):
-        req: api_pb2.SandboxWaitUntilReadyRequest = await stream.recv_message()
+        req: sr_pb2.SandboxWaitUntilReadyTcrRequest = await stream.recv_message()
         requests.append(req)
-        if len(requests) == 1:
-            # Pretend the first request timed out
-            raise GRPCError(Status.DEADLINE_EXCEEDED)
-        await stream.send_message(api_pb2.SandboxWaitUntilReadyResponse(ready_at=123.456))
-
-    with servicer.intercept() as ctx:
-        ctx.set_responder("SandboxWaitUntilReady", handle_wait_until_ready_request)
-        sb.wait_until_ready(timeout=5)
-        assert len(requests) == 2
-        assert requests[0].sandbox_id == sb.object_id
-        assert requests[1].sandbox_id == sb.object_id
-        assert 0 < requests[0].timeout <= 5
-        assert 0 < requests[1].timeout <= 5
-
-    sb.terminate()
-
-
-def test_sandbox_wait_until_ready_times_out_on_repeated_deadline_exceeded(app, servicer):
-    sb = Sandbox.create("bash", "-c", "sleep 100", app=app, readiness_probe=modal.Probe.with_tcp(8080))
-    requests: list[api_pb2.SandboxWaitUntilReadyRequest] = []
-
-    async def handle_wait_until_ready_request(servicer, stream):
-        req: api_pb2.SandboxWaitUntilReadyRequest = await stream.recv_message()
-        requests.append(req)
-        await stream.send_message(api_pb2.SandboxWaitUntilReadyResponse(ready_at=0))
+        # The worker signals that the sandbox did not become ready in time.
+        raise GRPCError(Status.DEADLINE_EXCEEDED, "Timed out waiting for sandbox to become ready")
 
     try:
-        with servicer.intercept() as ctx:
-            ctx.set_responder("SandboxWaitUntilReady", handle_wait_until_ready_request)
+        with servicer.task_command_router.intercept() as tcr_ctx:
+            tcr_ctx.set_responder("SandboxWaitUntilReady", handle_wait_until_ready_request)
             with pytest.raises(TimeoutError):
-                sb.wait_until_ready(timeout=1)
-            assert len(requests) >= 1
-            assert all(0 < req.timeout <= 1 for req in requests)
+                sb.wait_until_ready(timeout=5)
+            assert requests[0].task_id
+            assert 0 < requests[0].timeout <= 5
     finally:
         sb.terminate()
+
+
+@pytest.mark.parametrize("sandbox_version", [SandboxVersion.V1, SandboxVersion.V2], ids=["v1", "v2"])
+def test_sandbox_wait_until_ready_no_probe_raises_invalid_error(app, servicer, sandbox_version):
+    sb = _create_wait_until_ready_sandbox(app, sandbox_version, with_readiness_probe=False)
+
+    async def handle_wait_until_ready_request(servicer, stream):
+        await stream.recv_message()
+        # The worker rejects waits on sandboxes created without a readiness probe.
+        raise GRPCError(Status.FAILED_PRECONDITION, "Sandbox does not have a readiness probe configured")
+
+    with servicer.task_command_router.intercept() as tcr_ctx:
+        tcr_ctx.set_responder("SandboxWaitUntilReady", handle_wait_until_ready_request)
+        with pytest.raises(InvalidError, match="readiness probe"):
+            sb.wait_until_ready(timeout=5)
+
+    sb.terminate()
 
 
 def test_sandbox_create_reuses_hydrated_image(app, servicer):
@@ -1655,26 +1739,6 @@ def test_sandbox_create_reuses_hydrated_image(app, servicer):
 
         image_gets = ctx.get_requests("ImageGetOrCreate")
         assert len(image_gets) == 1, f"Expected 1 ImageGetOrCreate request, got {len(image_gets)}"
-
-
-def test_sandbox_wait_until_ready_retries_empty_ready_at(app, servicer):
-    sb = Sandbox.create("bash", "-c", "sleep 100", app=app, readiness_probe=modal.Probe.with_tcp(8080))
-    requests: list[api_pb2.SandboxWaitUntilReadyRequest] = []
-
-    async def handle_wait_until_ready_request(servicer, stream):
-        req: api_pb2.SandboxWaitUntilReadyRequest = await stream.recv_message()
-        requests.append(req)
-        if len(requests) == 1:
-            await stream.send_message(api_pb2.SandboxWaitUntilReadyResponse(ready_at=0))
-        else:
-            await stream.send_message(api_pb2.SandboxWaitUntilReadyResponse(ready_at=123.456))
-
-    with servicer.intercept() as ctx:
-        ctx.set_responder("SandboxWaitUntilReady", handle_wait_until_ready_request)
-        sb.wait_until_ready(timeout=5)
-        assert len(requests) == 2
-
-    sb.terminate()
 
 
 def test_sandbox_create_timing_log_caps_dependency_list():

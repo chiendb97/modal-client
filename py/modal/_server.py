@@ -49,10 +49,10 @@ class _Server:
     See [lifecycle hooks](https://modal.com/docs/guide/lifecycle-functions) for more information.
 
     Generally, you will not construct a Server directly.
-    Instead, use the [`@app.server()`](https://modal.com/docs/reference/modal.App#server) decorator.
+    Instead, use the [`@app.server()`](https://modal.com/docs/sdk/py/latest/modal.App#server) decorator.
 
     ```python notest
-    @app.server(port=8000, routing_region="us-east")
+    @app.server(port=8080, routing_region="us-east")
     class MyServer:
         @modal.enter()
         def start_server(self):

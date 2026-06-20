@@ -710,7 +710,7 @@ class _App:
         Modal functions can also be used as CLI entrypoints, but unlike `local_entrypoint`,
         those functions are executed remotely directly.
 
-        Note that an explicit [`app.run()`](https://modal.com/docs/reference/modal.App#run) is not needed, as an
+        Note that an explicit [`app.run()`](https://modal.com/docs/sdk/py/latest/modal.App#run) is not needed, as an
         [app](https://modal.com/docs/guide/apps) is automatically created for you.
 
         Args:
@@ -1066,7 +1066,7 @@ class _App:
         max_inputs: int | None = None,
     ) -> Callable[[CLS_T | _PartialFunction], CLS_T]:
         """
-        Decorator to register a new Modal [Cls](https://modal.com/docs/reference/modal.Cls) with this App.
+        Decorator to register a new Modal [Cls](https://modal.com/docs/sdk/py/latest/modal.Cls) with this App.
 
         Args:
             image: The image to run as the container for the class service.
@@ -1290,6 +1290,7 @@ class _App:
         scaleup_window: int | None = None,  # Stabilization window (seconds) of sustained demand before scaling up
         scaledown_window: int | None = None,  # Max idle time before scaling down (seconds)
         proxy: _Proxy | None = None,  # Modal Proxy to use in front of this server
+        unauthenticated: bool = False,  # Whether the endpoint requires proxy authentication, required by default.
         port: int = 8000,  # Port the HTTP server listens on
         startup_timeout: int = 30,  # Maximum startup time in seconds
         exit_grace_period: int = 0,  # Grace period for in-flight requests on shutdown
@@ -1334,10 +1335,11 @@ class _App:
             scaledown_window: Max idle time before scaling down (seconds).
             proxy: Modal Proxy to use in front of this server.
             port: Port the HTTP server listens on.
+            unauthenticated: Whether the endpoint requires proxy authentication, required by default.
             startup_timeout: Maximum startup time in seconds.
             exit_grace_period: Grace period for in-flight requests on shutdown.
             routing_region: Region to route Server requests through.
-            h2_enabled: Enable HTTP/2 in the container.
+            h2_enabled: Enable HTTP/2.
             target_concurrency: Target concurrency for the server; 0 disables autoscaling.
             cloud: Cloud provider (aws, gcp, oci, auto).
             region: Region(s) to run on.
@@ -1385,6 +1387,7 @@ class _App:
             startup_timeout=startup_timeout,
             exit_grace_period=exit_grace_period,
             h2_enabled=h2_enabled,
+            unauthenticated=unauthenticated,
         )
 
         # Build secrets list
